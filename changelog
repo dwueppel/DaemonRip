@@ -1,0 +1,24 @@
+daemonrip (1.0.2) stable; urgancy=low
+	
+	* Fixed a problem where the genre replacedment in the encoder line was not
+	implemented correctly. %g now works correctly.
+
+ -- Derek Wueppelmann <monkey@monkeynet.ca> Sat, 11 Feb 2006
+
+daemonrip (1.0.1) stable; ugrancy=low
+
+	* Added extra samples to the daemonrip.conf file
+
+	* Fixed a problem where when stopping the daemon it had to wait for the
+	existing sub process to finish prior to stopping the main daemon.
+
+	* Added a directory flag to the ripping program so that it knows where to
+	save the files to.
+
+ -- Derek Wueppelmann <monkey@monkeynet.ca> Wed, 11 Jan 2006
+
+daemonrip (1.0.0) stable; urgancy=low
+
+	* Initial release
+
+ -- Derek Wueppelmann <monkey@monkeynet.ca> Mon, 2 jan 2006

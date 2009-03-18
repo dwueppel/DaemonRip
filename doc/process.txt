@@ -1,0 +1,18 @@
+- Poll every x seconds to see if a disc is in the CD Drive and if that disc
+  contains music files.
+- Check it against the CDDB to get its infomation.
+- Using the specified ripping program rip the tracks to wav files.
+- Then convert the wave files into the appropriate format using the given
+  application.
+- Save the new file into the destination directory in the given format.
+- Eject the CD.
+
+Fomrat Optiosn
+---------------
+%a - Artist
+%A - Album
+%l - First letter of the artist
+%L - Firts letter of the album
+%n - Track Number (0 padded)
+%N - Track Number
+%t - Track title

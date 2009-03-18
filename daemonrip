@@ -1,0 +1,701 @@
+#!/usr/bin/perl -w
+#
+# Copyright (C) 2005   Derek Wueppelmann (monkey@monkeynet.ca)
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+use strict;
+use Fcntl;
+use Getopt::Long;
+use CDDB_get qw(get_cddb);
+use POSIX ":sys_wait_h";
+
+use constant {
+	STATUS_NONE => 0,
+	STATUS_STOP => 1,
+	STATUS_REREAD => 2,
+	CDROMEJECT => 0x5309,
+	CDROM_DRIVE_STATUS => 0x5326,
+	CDROM_DISC_STATUS  => 0x5327,
+	CDS_NO_INFO => 0,
+	CDS_NO_DISC => 1,
+	CDS_TRAY_OPEN => 2,
+	CDS_DRIVE_NOT_READY => 3,
+	CDS_DISC_OK => 4,
+	CDS_AUDIO => 100,
+	CDS_DATA_1 => 101,
+	CDS_DATA_2 => 102,
+	CDS_XA_2_1 => 103,
+	CDS_XA_2_2 => 104,
+	CDS_MIXED => 105
+};
+
+use vars qw($STATUS $VERSION);
+$STATUS = STATUS_NONE;
+$VERSION = "1.0.2";
+
+$| = 1;
+
+sub CHLD_SIG_TERM {
+	# Set the status flag to indicate that the process should be stopped.
+	$STATUS = STATUS_STOP;
+}
+
+sub REAPER {
+	my ($waitpid);
+	my ($rtnCode);
+	
+	$rtnCode = 0;
+	
+	while ($waitpid = waitpid(-1, &WNOHANG) > 0) {
+		$rtnCode = $?;
+	}
+	
+	return($rtnCode);
+}
+
+# Ignore terminated children.
+$SIG{'CHLD'} = \&REAPER;
+
+sub main() {
+	my ($configFile, $command);
+	my ($result);
+	my (%config);
+
+	# Get the command line options.
+	$result = GetOptions("config=s" => \$configFile);
+	$configFile = "/etc/daemonrip.conf" if (!defined($configFile) || $configFile eq '');
+
+	# Get the configuration.
+	%config = getConfig($configFile);
+	if (!exists($config{'ConfigFile'})) {
+		return(usage("Could not find configuration in file: $configFile"));
+	}
+	if (exists($config{'ErrorMessage'})) {
+		print STDERR "ERROR: $config{'ErrorMessage'}\n";
+		return(1);
+	}
+	
+	# Get the rest of the arguments, should just be the command
+	if (@ARGV != 1) {
+		return(usage("Incorrect command syntax"));
+	}
+	$command = $ARGV[0];
+
+	# Process the command
+	if (lc($command) eq 'start') {
+		return(start(\%config));
+	}
+	elsif (lc($command) eq 'stop') {
+		return(stop(\%config));
+	}
+	elsif (lc($command) eq 'status') {
+		return(status(\%config));
+	}
+	elsif (lc($command) eq 'stats') {
+		return(stats(\%config));
+	}
+	else {
+		return(usage("Invalide command give"));
+	}
+
+	return(0);
+}
+
+sub usage {
+	my ($message) = @_;
+	
+	if (defined($message) && $message ne '') {
+		print STDERR "$message\n";
+	}
+	print STDERR" DaemonRip Version $VERSION\n";
+	print STDERR "USAGE: $0 [-c CONFFILE | --config=CONFFILE] start | stop | status | stats\n" .
+		"-c | --config=        Specify the configuration file instead of using the\n" .
+		"                      default of /etc/daemonrip.conf\n" .
+		"start                 Start the daemon process\n" .
+		"stop                  Stop the daemon process\n" .
+		"status                Return status information about the running process\n" .
+		"stats                 Return statistics about the current running process\n";
+
+	return(1);
+}
+
+sub getConfig($) {
+	my ($confFile) = @_;
+	my (%config);
+	local (*CONF, *FILE);
+
+	# Set some of the default values:
+	%config = (
+		'cddb' => 'freedb.org',
+		'storage_directory' => './',
+		'storage_user' => 'root',
+		'storage_group' => 'root',
+		'storage_mode' => '664',
+		'save_format' => '%a/%A/%n - %t',
+		'ripper' => 'cdparanoia',
+		'encoder' => 'oggenc',
+		'encoder_extension' => 'ogg',
+		'runfile' => '/var/run/daemonrip.pid',
+		'data_directory' => '/usr/lib/daemonrip',
+		'logfile' => '/var/log/daemonrip.log',
+		'poll_interval' => 5,
+		'cdrom_device' => '/dev/cdrom',
+	);
+
+	# Open the file.
+	open(CONF, $confFile) || return(());
+
+	# Now process the file.
+	while (<CONF>) {
+		next if (/^#/);
+		chomp();
+		if (/^([^=]+?)\s*=\s*['"]?(.*?)['"]?$/) {
+			$config{$1} = $2;
+		}
+	}
+	close(CONF);
+
+	# Verify that the storage_directory can be written to.
+	if (!open(FILE, ">$config{'storage_directory'}/DaemonRip")) {
+		$config{'ErrorMessage'} = "Could not write to storage_directory: $config{'storage_directory'}";
+	}
+	close(FILE);
+	system("rm $config{'storage_directory'}/DaemonRip >/dev/null 2>&1");
+	
+	# Verify that we can write to the data_directory
+	if (!open(FILE, ">>$config{'data_directory'}/status")) {
+		$config{'ErrorMessage'} = "Could not write to data_directory: $config{'data_directory'}";
+	}
+	close(FILE);
+
+	# Verify that we can write to the log file.
+	if (!open(FILE, ">>$config{'logfile'}")) {
+		$config{'ErrorMessage'} = "Could not write to the logfile: $config{'logfile'}";
+	}
+	close(FILE);
+
+	$config{'ConfigFile'} = $confFile;
+
+	return(%config);
+}
+
+# Start the process if it is not already running.
+sub start($) {
+	my ($config) = @_;
+	my ($pid);
+	local (*PIDFILE);
+
+	# Check to see if the process is running:
+	$pid = getRunningPid($config);
+	if ($pid != 0) {
+		# The process is currently running.
+		print STDERR "Cannot start DaemonRip it is currently running. If you\n" .
+				"are sure that this process is not running try deleting the file\n" .
+				"$$config{'runfile'}\n";
+		return(10);
+	}
+
+	# Check to make sure we can actually write to the runfile
+	if (!open(PIDFILE, ">$$config{'runfile'}")) {
+		print STDERR "Cannot write to the file: $$config{'runfile'}\n";
+		return(11);
+	}
+	close(PIDFILE);
+
+	# Start the Daemon process
+	write_log($config, "Starting DaemonRip");
+	$pid = fork();
+	if ($pid == 0) {
+		# Child Process.
+		$SIG{'TERM'} = \&CHLD_SIG_TERM;
+		return(runDaemon($config));
+	}
+	else {
+		# The parent process.
+		open(PIDFILE, ">$$config{'runfile'}");
+		print PIDFILE "$pid";
+		close(PIDFILE);
+
+		return(0);
+	}
+}
+
+# Stop the running process. Issue a message if no process is currently running.
+sub stop($) {
+	my ($config) = @_;
+	my ($pid);
+	my (%status);
+
+	# Get the running PID
+	$pid = getRunningPid($config);
+
+	if ($pid == 0) {
+		# No currently running process.
+		print STDERR "DaemonRip is not currenlty running.\n";
+		return(20);
+	}
+
+	# Attempt to kill the process.
+	write_log($config, "Stopping DaemonRip");
+	print STDERR "Stopping DaemonRip";
+	
+	%status = getStatus($config);
+	if (exists($status{'RIP'}) && $status{'RIP'} ne '') {
+		print STDERR "\nWaitting for ripping of $status{'RIP'} to finish";
+	}
+	
+	if (kill(15, $pid) != 1) {
+		print STDERR " Failed\n";
+		return(21);
+	}
+	# Wait until the process has been killed.
+	while (kill(0, $pid)) {
+		sleep(1);
+		print STDERR "."
+	}
+	
+	system("rm $$config{'runfile'} >/dev/null 2>&1");
+	print STDERR " Success\n";
+	return(0);
+}
+
+# Return the running status of the process. This includes what the process
+# is actually doing right now, is it processing a track, ripping it, etc.
+sub status($) {
+	my ($config) = @_;
+	my (%status, $pid);
+
+	%status = getStatus($config);
+
+	if (!defined($status{'STATUS'})  || $status{'STATUS'} eq '') {
+		print "DaemonRip is not currently runing. or no status can be determined\n";
+		return(0);
+	}
+
+	# Print out the base status.
+	$pid = getRunningPid($config);
+	print "DaemonRip is Currently running as PID: $pid\n";
+	
+	# Display the statys.
+	print "Status: $status{'STATUS'}\n";
+	# Show which track is currently being rippedl if any.
+	print "Ripping: $status{'RIP'}\n" if (exists($status{'RIP'}) && $status{'RIP'} ne '');
+	# Show which  track is currently being encoded if any.
+	print "Encoding: $status{'ENCODE'}\n" if (exists($status{'ENCODE'}) && $status{'ENCODE'} ne '');
+
+	return(0);
+}
+
+# Return the stats of the running system. How many tracks/cds have been ripped
+# by this daemon. What is the average rip time, what is the average encoding 
+# time, etc.
+sub stats($) {
+	my ($config) = @_;
+	my ($avgEncode, $avgRip, $numEncode, $numRip, $numFail);
+	my ($maxEncode, $minEncode, $maxRip, $minRip);
+	my ($type, $time, $totalEncode, $totalRip);
+	local (*STATS);
+
+	if (!open(STATS, "$$config{'data_directory'}/stats.db")) {
+		print "Can't find the stats.db file in $$config{'data_directory'}\n";
+		print "No stats can be found\n";
+		return;
+	}
+
+	# Default to 0 values.
+	$numEncode = $numRip = $numFail = $totalEncode = $totalRip = 0;
+	$minEncode = $maxEncode = $minRip = $maxRip = 0;
+
+	# Read the stats
+	while (<STATS>) {
+		if (/\"([^\"]+)\",\"([^\"]+)\"/) {
+			$type = $1;
+			$time = $2;
+
+			if ($type eq 'FAILED') {
+				$numFail++;
+			}
+			elsif ($type eq 'RIP') {
+				$numRip++;
+				$totalRip += $time;
+				if ($minRip == 0 || $time < $minRip) {
+					$minRip = $time;
+				}
+				elsif ($time > $maxRip) {
+					$maxRip = $time;
+				}
+			}
+			elsif ($type eq 'ENCODE') {
+				$numEncode++;
+				$totalEncode += $time;
+				if ($minEncode == 0 || $time < $minEncode) {
+					$minEncode = $time;
+				}
+				elsif ($time > $maxEncode) {
+					$maxEncode = $time;
+				}
+			}
+		}
+	}
+
+	# Close the file.
+	close(STATS);
+
+	# Now calcualte the averages
+	$avgRip = ($totalRip / $numRip);
+	$avgRip =~ s/(\.\d{2})\d+$/$1/;
+	$avgEncode = ($totalEncode / $numEncode);
+	$avgEncode =~ s/(\.\d{2})\d+$/$1/;
+
+	# Print out the stats.
+	print "DaemonRip Statistics:\n";
+	print "Total Ripped:  $numRip\n";
+	print "Total Encoded: $numEncode\n";
+	print "Total Failed:  $numFail\n\n";
+	print "Times given in seconds\n\n";
+	print "Average Rip Time:    $avgRip\n";
+	print "Average Encode Time: $avgEncode\n\n";
+	print "Maximum Encode Time: $maxEncode\n";
+	print "Minimum Encode Time: $minEncode\n\n";
+	print "Maximum Rip Time: $maxRip\n";
+	print "Minimum Rip Time: $minRip\n";
+
+	return(0);
+}
+
+sub getRunningPid($) {
+	my ($config) = @_;
+	my ($pid);
+	local (*PIDFILE);
+
+	open(PIDFILE, $$config{'runfile'}) or return(0);
+	$pid = join("", <PIDFILE>);
+	close(PIDFILE);
+
+	if ($pid =~ /^\d+$/) {
+		return($pid);
+	}
+	else {
+		return(0);
+	}
+}
+
+sub runDaemon($) {
+	my ($config) = @_;
+	my ($status, %cddb_config, %cd);
+	my ($track, $tno, $command, $fileName, $pid);
+	my ($startTime, $elapsedTime);
+	my ($rtnCode);
+	local (*CD);
+
+	# Keep processing while we havn't been told to stop.
+	while ($STATUS != STATUS_STOP) {
+		# First check to see if there is a CD in the drive that we can process.
+		$status = 0;
+		setStatus($config, "STATUS", "Checking Disk");
+		if (sysopen(CD, $$config{'cdrom_device'}, O_RDONLY | O_NONBLOCK)) {
+			# Check to see if the disk is OK.
+			$status = ioctl(CD, CDROM_DRIVE_STATUS, 0);
+			if ($status & CDS_DISC_OK) {
+				$status = ioctl(CD, CDROM_DISC_STATUS, 0);
+				if ($status != CDS_AUDIO && $status != CDS_XA_2_1 && $status != CDS_XA_2_2 && $status != CDS_MIXED) {
+					# Not an audio cd.
+					$status = 0;
+				}
+			}
+			else {
+				# No disc found.
+				$status = 0;
+			}
+			close(CD);
+		}
+		if ($status == 0) {	
+			# No CD, sleep for the given period and then retry.
+			setStatus($config, "STATUS", "Sleeping");
+			sleep($$config{'poll_interval'});
+			next;
+		}
+		write_log($config, "Found a valid CD");
+
+		# Now get the CDDB information
+		setStatus($config, "STATUS", "Getting CDDB information");
+		%cddb_config = (
+			'CDDB_HOST' => $$config{'cddb'},
+			'CDDB_PORT' => $$config{'cddb_port'},
+			'CDDB_MODE' => $$config{'cddb_mode'},
+			'CD_DEVICE' => $$config{'cdrom_device'},
+			'input' => 0
+		);
+		write_log($config, "Getting CDDB information");
+		%cd = get_cddb(\%cddb_config);
+		$cd{'title'} =~ s/\r\n/ /gs;
+
+		if (!exists($cd{'title'}) || !defined($cd{'title'})) {
+			# If the information was not found look for a text file that describes the cd's contents.
+			# Not defined currently
+			if (sysopen(CD, $$config{'cdrom_device'}, O_RDONLY | O_NONBLOCK)) {
+				$status = ioctl(CD, CDROMEJECT, 0);
+				close(CD);
+			}
+			next;
+		}
+		
+		write_log($config, "Processing CD: $cd{'artist'} - $cd{'title'} (" . scalar(@{$cd{'track'}}) . " Tracks)");
+
+		# For each CD Track.
+		setStatus($config, "STATUS", "Ripping CD: $cd{'title'} (" . scalar(@{$cd{'track'}}) . " Tracks)");
+		$tno = 0;
+		foreach $track (@{$cd{'track'}}) {
+			$tno++;
+			# Rip the CD track to a wave file.
+			# First get the filename to save the file as.
+			$fileName = makeFileName($config, $track, $tno, \%cd);
+
+			$startTime = time();
+			$command = "$$config{'ripper'}";
+			$command =~ s/\%f/"$fileName.wav"/g;
+			$command =~ s/\%t/$tno/g;
+			$command =~ s/\%d/$$config{'storage_directory'}/g;
+			$command =~ s/[\n\r]//g;
+			$command =~ s/([`])/\\$1/g;
+			setStatus($config, "RIP", "$track ($tno of " . scalar(@{$cd{'track'}}) . ")");
+			$rtnCode = system("$command > /tmp/daemonrip-ripping.log 2>&1");
+			clearStatus($config, "RIP");
+			if ($rtnCode) {
+				write_log($config, "Failed to rip (Track NO: $tno): $track (Error Code: $rtnCode)");
+				writeStats($config, "FAILED", 0);
+				unlink("$fileName.wav");
+				next;
+			}
+			write_log($config, "Ripped (Track NO: $tno): $track");
+			writeStats($config, 'RIP', time() - $startTime);
+
+			# Fork a process to encode this ripped wave file.
+			$pid = fork();
+			if ($pid == 0) {
+				# Child process, encode the ripped file.
+				$command = "$$config{'encoder'}";
+				# Input file
+				$command =~ s/\%w/"$fileName\.wav"/g;
+				# Artist
+				$command =~ s/\%a/'"' . escape("$cd{'artist'}") . '"'/ge;
+				# Album
+				$command =~ s/\%A/'"' .escape("$cd{'title'}") . '"'/ge;
+				# Genre
+				$command =~ s/\%g/'"' .escape("$cd{'cat'}") . '"'/ge;
+				# Track Number
+				$command =~ s/\%N/$tno/g;
+				# Track Title
+				$command =~ s/\%t/'"' . escape("$track") . '"'/ge;
+				# Output file
+				$command =~ s/\%f/"$fileName\.$$config{'encoder_extension'}"/g;
+				# Remove any newline chars
+				$command =~ s/[\n\r]//g;
+				
+				$startTime = time();
+				setStatus($config, "ENCODE", "$track ($tno of " . scalar(@{$cd{'track'}}) . ")");
+				$rtnCode = system("$command >/dev/null 2>&1");
+				clearStatus($config, "ENCODE");
+				if ($rtnCode) {
+					write_log($config, "Failed to encode (Track NO: $tno): $track (Error Code: $rtnCode)");
+					writeStats($config, "FAILED", 0);
+					exit(0);
+				}
+				write_log($config, "Encoded (Track NO: $tno): $track");
+				clearStatus($config, "ENCODE'");
+				writeStats($config, 'ENCODE', time() - $startTime);
+				system("rm -f \"$fileName.wav\" >/dev/null 2>&1");
+
+				system("chmod $$config{'storage_mode'} \"$fileName.$$config{'encoder_extension'}\" >/dev/null 2>&1");
+				system("chown $$config{'storage_user'} \"$fileName.$$config{'encoder_extension'}\" >/dev/null 2>&1");
+				system("chgrp $$config{'storage_group'} \"$fileName.$$config{'encoder_extension'}\" >/dev/null 2>&1");
+				exit(0);
+			}
+
+			last if ($STATUS == STATUS_STOP);
+		}
+		
+		# Eject the disk
+		if (sysopen(CD, $$config{'cdrom_device'}, O_RDONLY | O_NONBLOCK)) {
+			$status = ioctl(CD, CDROMEJECT, 0);
+			close(CD);
+		}
+		
+		setStatus($config, "STATUS", "IDLE");
+	}
+}
+
+sub makeFileName($$$$) {
+	my ($config, $track, $tno, $cd) = @_;
+	my ($var, $fileName, $baseDir);
+
+	# Start with the base
+	$fileName = $$config{'save_format'};
+	
+	# Artist
+	$var = escape($$cd{'artist'});
+	$fileName =~ s/\%a/$var/g;
+	# Album
+	$var = escape($$cd{'title'});
+	$fileName =~ s/\%A/$var/g;
+	# 0 padded track number
+	$var = $tno;
+	while (length($var) < length($$cd{'tno'})) {
+		$var = "0$var";
+	}
+	$fileName =~ s/\%n/$var/g;
+	# Track Number
+	$fileName =~ s/\%N/$tno/g;
+	# Track Title
+	$var = escape($track);
+	$fileName =~ s/\%t/$var/g;
+	# First letter of Artist
+	$var = lc($$cd{'artist'});
+	$var =~ s/^\W//g;
+	$var =~ s/^(.).*$/$1/;
+	$fileName =~ s/\%l/$var/g;
+	# First letter of Album
+	$var = lc($$cd{'title'});
+	$var =~ s/^\W//g;
+	$var =~ s/^(.).*$/$1/;
+	$fileName =~ s/\%L/$var/g;
+
+	# Prepend the storage directory.
+	$fileName = "$$config{'storage_directory'}/$fileName";
+	$fileName =~ s/[\n\r]//g;
+
+	# Get the base directory and make sure that it exists.
+	$baseDir = $fileName;
+	$baseDir =~ s/\/[^\/]+$//g;
+	while ($baseDir =~ /\\$/) {
+		$baseDir =~ s/\/[^\/]+\\$//;
+	}
+	buildDirectory($config, $baseDir);
+
+	# Return the created filename
+	return($fileName);
+}
+
+sub escape($) {
+	my ($string) = @_;
+
+	$string =~ s/\//-/g;
+	$string =~ s/[\\\/:\*\?"<>|`\"]/ /g;
+	$string =~ s/\s+/ /g;
+	$string =~ s/^\s+//g;
+	$string =~ s/\s+$//g;
+
+	return($string);
+}
+
+sub setStatus($$$) {
+	my ($config, $type, $string) = @_;
+	my (%status);
+	local (*STATUS);
+
+	# Get the current status information.
+	%status = getStatus($config);
+	$status{$type} = $string;
+
+	writeStatus($config, \%status);
+}
+
+sub clearStatus($$) {
+	my ($config, $type) = @_;
+	my (%status);
+
+	%status = getStatus($config);
+	$status{$type} = '';
+
+	writeStatus($config, \%status);
+}
+
+sub writeStats($$$) {
+	my ($config, $type, $time) = @_;
+	local (*STATS);
+
+	open(STATS, ">>$$config{'data_directory'}/stats.db");
+	print STATS "\"$type\",\"$time\"\n";
+	close(STATS);
+}
+
+# Get the current status values.
+sub getStatus($) {
+	my ($config) = @_;
+	my (%status);
+	local (*FILE);
+
+	open(FILE, "$$config{'data_directory'}/status") or return(());
+	while(<FILE>) {
+		chomp();
+		if (/^(.*?):\s+(.*)$/) {
+			$status{$1} = $2;
+		}
+	}
+	close(FILE);
+
+	return(%status);
+}
+
+# Write out the given status information to the status file
+sub writeStatus($$) {
+	my ($config, $status) = @_;
+	my ($key);
+	local (*STATUS);
+
+	open(STATUS, ">$$config{'data_directory'}/status");
+	foreach $key (keys(%$status)) {
+		print STATUS "$key: $$status{$key}\n";
+	}
+	close(STATUS);
+}
+
+sub write_log($$) {
+	my ($config, $logMessage) = @_;
+	local (*LOG);
+
+	open(LOG, ">>$$config{'logfile'}") or return;
+	print LOG "" . localtime() . " $logMessage\n";
+	close(LOG);
+}
+
+# Build the directory and it's parents with the appropriate permissions
+sub buildDirectory($$) {
+	my ($config, $dir) = @_;
+	my ($oneUp);
+
+	# Return if the given directory exists.
+	return if (-e $dir);
+
+	# Obviously this directory did not exist. Does the parrent exist.
+	$oneUp = $dir;
+	$oneUp =~ s/\/[^\/]+$//;
+	while ($oneUp =~ /\\$/) {
+		$oneUp =~ s/\/[^\/]+\\$//;
+	}
+
+	if (! -e $oneUp) {
+		&buildDirectory($config, $oneUp);
+	}
+
+	mkdir($dir);
+	system("chmod $$config{'storage_mode'} \"$dir\" >/dev/null 2>&1");
+	system("chmod a+x \"$dir\" >/dev/null 2>&1");
+	system("chown $$config{'storage_user'} \"$dir\" >/dev/null 2>&1");
+	system("chgrp $$config{'storage_group'} \"$dir\" >/dev/null 2>&1");
+}
+
+exit(main());
